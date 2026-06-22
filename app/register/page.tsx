@@ -37,53 +37,45 @@ export default function RegisterPage() {
 
   return (
     <AuthShell title="创建账号" subtitle="开始构建你的智能笔记知识库">
-      <form onSubmit={onSubmit}>
-        <div className="field">
-          <label className="label" htmlFor="email">
-            邮箱
-          </label>
-          <input
-            id="email"
-            className="input"
-            type="email"
-            placeholder="you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            autoFocus
-            required
-          />
-        </div>
-        <div className="field">
-          <label className="label" htmlFor="password">
-            密码
-          </label>
-          <input
-            id="password"
-            className="input"
-            type="password"
-            placeholder="至少 6 位"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            minLength={6}
-            required
-          />
-        </div>
+      <form onSubmit={onSubmit} className="auth-form">
+        <label className="label" htmlFor="email">
+          邮箱
+        </label>
+        <input
+          id="email"
+          className="input"
+          type="email"
+          placeholder="you@example.com"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+          autoFocus
+          required
+        />
+        <label className="label auth-label-password" htmlFor="password">
+          密码
+        </label>
+        <input
+          id="password"
+          className="input"
+          type="password"
+          placeholder="至少 6 位"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          minLength={6}
+          required
+        />
         <button
-          className="btn"
+          className="btn auth-submit"
           type="submit"
           disabled={submitting}
-          style={{ width: "100%" }}
         >
           {submitting ? <span className="spinner" /> : null}
           注册并登录
         </button>
       </form>
-      <p style={{ textAlign: "center", fontSize: 14, color: "var(--text-muted)", marginTop: 18 }}>
-        已有账号？{" "}
-        <Link
-          href="/login"
-          style={{ color: "var(--primary)", fontWeight: 550 }}
-        >
+      <p className="auth-alt">
+        已有账号？
+        <Link href="/login" className="auth-alt-link">
           返回登录
         </Link>
       </p>
