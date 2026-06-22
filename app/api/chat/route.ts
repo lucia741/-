@@ -1,3 +1,4 @@
+import { after } from "next/server";
 import {
   streamText,
   convertToModelMessages,
@@ -21,22 +22,30 @@ import {
   saveChatMessage,
   toCitedNoteMeta,
 } from "@/lib/chat/service";
+import { db } from "@/lib/db";
+import { chatSessions } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
 
 export const maxDuration = 60;
 
-const bodySchema = z.object({
-  messages: z.array(z.unknown()).optional(),
-  message: z.string().optional(),
-  history: z
-    .array(
-      z.object({
-        role: z.enum(["user", "assistant"]),
-        content: z.string(),
-      })
-    )
-    .optional(),
-  sessionId: z.string().uuid().optional(),
-});
+const bodySchema = z
+  .object({
+    messages: z.array(z.unknown()).optional(),
+    message: z.string().optional(),
+    history: z
+      .array(
+        z.object({
+          role: z.enum(["user", "assistant"]),
+          content: z.string(),
+        })
+      )
+      .optional(),
+    sessionId: z.string().uuid().nullish(),
+    id: z.string().optional(),
+    trigger: z.string().optional(),
+    messageId: z.string().optional(),
+  })
+  .passthrough();
 
 export async function POST(request: Request) {
   const auth = await requireAuth();
@@ -61,12 +70,13 @@ export async function POST(request: Request) {
     const body = await request.json();
     const parsed = bodySchema.safeParse(body);
     if (!parsed.success) {
+      console.error("[chat/POST] validation:", parsed.error.flatten());
       return NextResponse.json({ error: "参数错误" }, { status: 400 });
     }
 
     let question: string;
     let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>;
-    const sessionIdInput = parsed.data.sessionId;
+    const sessionIdInput = parsed.data.sessionId ?? undefined;
 
     if (Array.isArray(body.messages)) {
       const messages = body.messages as UIMessage[];
@@ -88,6 +98,13 @@ export async function POST(request: Request) {
       question
     );
 
+    if (session.title === "新对话" && question) {
+      await db
+        .update(chatSessions)
+        .set({ title: question.slice(0, 30) })
+        .where(eq(chatSessions.id, session.id));
+    }
+
     await saveChatMessage(session.id, { role: "user", content: question });
 
     const { notes, strategy } = await retrieveNotesForQuestion(
@@ -103,6 +120,17 @@ export async function POST(request: Request) {
       model: getAiModel(),
       system,
       messages: modelMessages,
+      onFinish: async ({ text }) => {
+        if (!text) return;
+        after(async () => {
+          await saveChatMessage(session.id, {
+            role: "assistant",
+            content: text,
+            citedNotes,
+            retrievalStrategy: strategy,
+          });
+        });
+      },
     });
 
     return result.toUIMessageStreamResponse({
@@ -112,20 +140,6 @@ export async function POST(request: Request) {
         "X-ZhiNote-Retrieval": strategy,
         "X-ZhiNote-Model": AI_CONFIG.model,
         "X-RateLimit-Remaining": String(remaining),
-      },
-      onFinish: async ({ responseMessage }) => {
-        const text = responseMessage.parts
-          .filter((p): p is { type: "text"; text: string } => p.type === "text")
-          .map((p) => p.text)
-          .join("");
-        if (text) {
-          await saveChatMessage(session.id, {
-            role: "assistant",
-            content: text,
-            citedNotes,
-            retrievalStrategy: strategy,
-          });
-        }
       },
     });
   } catch (error) {
