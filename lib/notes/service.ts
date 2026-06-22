@@ -49,9 +49,9 @@ async function attachTags(
 
 export async function listNotes(
   userId: string,
-  options: { q?: string; tag?: string } = {}
+  options: { q?: string; tag?: string; limit?: number; offset?: number } = {}
 ): Promise<NoteWithTags[]> {
-  const { q, tag } = options;
+  const { q, tag, limit = 100, offset = 0 } = options;
 
   let noteRows: (typeof notes.$inferSelect)[];
 
@@ -69,6 +69,8 @@ export async function listNotes(
         )
       )
       .orderBy(desc(notes.updatedAt))
+      .limit(limit)
+      .offset(offset)
       .then((rows) => rows.map((r) => r.note));
   } else if (q) {
     const pattern = `%${q}%`;
@@ -81,13 +83,17 @@ export async function listNotes(
           or(ilike(notes.title, pattern), ilike(notes.content, pattern))
         )
       )
-      .orderBy(desc(notes.updatedAt));
+      .orderBy(desc(notes.updatedAt))
+      .limit(limit)
+      .offset(offset);
   } else {
     noteRows = await db
       .select()
       .from(notes)
       .where(eq(notes.userId, userId))
-      .orderBy(desc(notes.updatedAt));
+      .orderBy(desc(notes.updatedAt))
+      .limit(limit)
+      .offset(offset);
   }
 
   return attachTags(userId, noteRows);
@@ -166,6 +172,11 @@ export async function createNote(
   const tagIds = await upsertTagsForUser(userId, data.tagNames ?? []);
   await syncNoteTags(note.id, tagIds);
 
+  const { syncNoteEmbedding } = await import("@/lib/ai/vector-search");
+  syncNoteEmbedding(note.id, userId, data.title, data.content ?? "").catch(
+    console.error
+  );
+
   const result = await getNoteById(userId, note.id);
   return result!;
 }
@@ -194,7 +205,18 @@ export async function updateNote(
     await syncNoteTags(noteId, tagIds);
   }
 
-  return getNoteById(userId, noteId);
+  const updated = await getNoteById(userId, noteId);
+  if (updated) {
+    const { syncNoteEmbedding } = await import("@/lib/ai/vector-search");
+    syncNoteEmbedding(
+      noteId,
+      userId,
+      updated.title,
+      updated.content
+    ).catch(console.error);
+  }
+
+  return updated;
 }
 
 export async function deleteNote(

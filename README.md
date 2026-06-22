@@ -2,115 +2,106 @@
 
 > 和自己的知识库聊天：创建笔记、标签分类，并通过 AI 针对你的笔记提问与总结。
 
+## 功能清单
+
+- 用户注册 / 登录 / 退出（JWT Cookie + bcrypt）
+- 笔记 CRUD + 标签 + 关键词搜索
+- **Markdown** 编辑器（编辑 / 预览）
+- 仪表盘统计
+- **向量 RAG**（百炼 Embedding + pgvector 语义检索）
+- AI 流式对话（通义千问 qwen-plus）
+- 对话历史持久化 + 引用笔记来源展示
+- Middleware 路由保护 + AI 接口限流
+
 ## 技术栈
 
-- **Next.js 16** — App Router + API Routes
-- **Neon** — Serverless PostgreSQL
-- **Drizzle ORM** — 类型安全的数据库访问
-- **JWT Cookie** — 会话认证（bcrypt 密码加密）
-- **Vercel AI SDK + AI Gateway** — 基于笔记的流式问答（RAG 简化版）
+- Next.js 16 · Drizzle ORM · Neon PostgreSQL · pgvector
+- 阿里云百炼 DashScope（Chat + Embedding）
+- Vercel AI SDK · Tailwind v4
 
 ## 快速开始
 
-### 1. 配置环境变量
+### 1. 环境配置
 
 ```powershell
 cd zhinote
-copy .env.example .env.local
-```
-
-编辑 `.env.local`，填入 Neon 的 `DATABASE_URL`、随机 `SESSION_SECRET`，以及 `AI_GATEWAY_API_KEY`。
-
-### 2. 初始化数据库
-
-在 Neon SQL Editor 中执行 `drizzle/0000_init.sql`，或使用 Drizzle Kit：
-
-```powershell
-npm run db:push
-```
-
-### 3. 启动开发服务器
-
-```powershell
 npm install
+npm run setup          # 生成 SESSION_SECRET，创建/更新 .env.local
+```
+
+编辑 `.env.local`，填入：
+
+```env
+DATABASE_URL=postgresql://...   # Neon 连接串
+DASHSCOPE_API_KEY=sk-...        # 百炼 API Key
+SESSION_SECRET=...              # setup 脚本已自动生成
+AI_MODEL=qwen-plus              # 可选
+```
+
+### 2. 数据库
+
+```powershell
+npm run db:push        # Drizzle 同步 schema
+# 或（需先填 DATABASE_URL）
+npm run db:migrate     # 执行 drizzle/0001_features.sql（pgvector 等）
+```
+
+在 Neon 控制台需启用 **pgvector** 扩展（迁移脚本会自动 `CREATE EXTENSION vector`）。
+
+### 3. 启动
+
+```powershell
 npm run dev
 ```
 
 访问 http://localhost:3000
 
-## API 接口
+## 部署 Vercel（阶段 4）
 
-所有受保护接口需登录（httpOnly Cookie 自动携带）。
+1. 将仓库推送到 GitHub
+2. [vercel.com](https://vercel.com) → Import Project → 选择 `zhinote` 目录
+3. 在 Vercel 环境变量中配置：
+   - `DATABASE_URL`
+   - `SESSION_SECRET`
+   - `DASHSCOPE_API_KEY`
+   - `AI_MODEL`（可选）
+4. Deploy
 
-### 认证
+或使用 CLI：
 
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/auth/register` | 注册 `{ email, password }` |
-| POST | `/api/auth/login` | 登录 |
-| POST | `/api/auth/logout` | 退出 |
-| GET | `/api/auth/me` | 当前用户 |
-
-### 笔记
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/notes?q=&tag=` | 列表 / 关键词搜索 / 标签筛选 |
-| POST | `/api/notes` | 创建 `{ title, content?, tags? }` |
-| GET | `/api/notes/:id` | 单条详情 |
-| PUT | `/api/notes/:id` | 更新 |
-| DELETE | `/api/notes/:id` | 删除 |
-
-### 其他
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/tags` | 标签列表（含笔记数） |
-| GET | `/api/dashboard` | 仪表盘统计 + 最近编辑 |
-
-### AI 对话
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/chat` | 基于笔记问答，**流式返回** `{ message, history? }` |
-| GET | `/api/chat/preview?q=` | 预览检索到的笔记（调试 RAG，不消耗 AI 额度） |
-
-**POST /api/chat 示例：**
-
-```json
-{
-  "message": "我关于项目管理的笔记讲了什么？",
-  "history": [
-    { "role": "user", "content": "上一句问题" },
-    { "role": "assistant", "content": "上一句回答" }
-  ]
-}
+```powershell
+npx vercel login
+npx vercel --prod
 ```
 
-响应为 AI SDK UI Message Stream，阶段 3 前端可用 `@ai-sdk/react` 的 `useChat` 直接对接。
+## API 概览
 
-## 安全设计
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/chat` | AI 对话（流式），body 含 `sessionId` |
+| GET/POST | `/api/chat/sessions` | 对话列表 / 新建 |
+| GET/DELETE | `/api/chat/sessions/:id` | 对话详情 / 删除 |
+| GET | `/api/chat/preview?q=` | 预览 RAG 检索结果 |
 
-- 所有笔记/标签查询均按 `user_id` 过滤，用户只能访问自己的数据
-- 密码 bcrypt 加密存储
-- 会话 token 存 httpOnly Cookie，前端 JS 无法读取
+完整 API 见上方各模块路由。
 
-## 开发路线
+## 安全说明
 
-- [x] **阶段 1** — 数据库 + 认证 + 笔记 CRUD
-- [x] **阶段 2** — AI 对话（RAG 简化版 + 流式返回）
-- [ ] **阶段 3** — 前端界面（v0 + Cursor）
-- [ ] **阶段 4** — 联调部署 Vercel
+- 所有数据按 `user_id` 隔离
+- AI 对话：每用户每分钟默认 20 次（`AI_RATE_LIMIT_PER_MIN`）
+- **切勿**将 `DASHSCOPE_API_KEY` 提交到 Git 或暴露在前端
+- API Key 若曾泄露，请在百炼控制台轮换
 
 ## 项目结构
 
 ```
 zhinote/
-├── app/api/          # REST API 路由
-├── lib/
-│   ├── ai/           # RAG 检索、Prompt 构建、模型配置
-│   ├── auth/         # 密码、会话、鉴权
-│   ├── db/           # Drizzle schema + 连接
-│   └── notes/        # 笔记业务逻辑
-└── drizzle/          # SQL 迁移文件
+├── app/(app)/        # 受保护页面（dashboard / notes / chat）
+├── app/(auth)/       # 登录页
+├── app/api/          # REST API
+├── components/       # UI 组件
+├── lib/ai/           # RAG、Embedding、Prompt
+├── lib/chat/         # 对话持久化
+├── middleware.ts     # 路由鉴权
+└── drizzle/          # SQL 迁移
 ```

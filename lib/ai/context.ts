@@ -1,24 +1,32 @@
 import { listNotes, type NoteWithTags } from "@/lib/notes/service";
+import { searchNotesByVector } from "@/lib/ai/vector-search";
 import { trimNotesToLimit } from "./prompt";
 
-/** 从用户问题中检索相关笔记（RAG 简化版） */
+export type RetrievalStrategy = "vector" | "search" | "all" | "empty";
+
+/** 从用户问题中检索相关笔记（向量 + 关键词 RAG） */
 export async function retrieveNotesForQuestion(
   userId: string,
   question: string
-): Promise<{ notes: NoteWithTags[]; strategy: "search" | "all" | "empty" }> {
+): Promise<{ notes: NoteWithTags[]; strategy: RetrievalStrategy }> {
   const trimmed = question.trim();
   if (!trimmed) {
     return { notes: [], strategy: "empty" };
   }
 
-  // 1. 先用问题关键词搜索
-  let notes = await listNotes(userId, { q: trimmed });
+  // 1. 向量语义检索
+  const vectorNotes = await searchNotesByVector(userId, trimmed);
+  if (vectorNotes.length > 0) {
+    return { notes: trimNotesToLimit(vectorNotes), strategy: "vector" };
+  }
 
+  // 2. 关键词搜索
+  let notes = await listNotes(userId, { q: trimmed });
   if (notes.length > 0) {
     return { notes: trimNotesToLimit(notes), strategy: "search" };
   }
 
-  // 2. 拆词再搜（简单分词：中英文片段）
+  // 3. 拆词再搜
   const terms = extractSearchTerms(trimmed);
   const seen = new Set<string>();
   const merged: NoteWithTags[] = [];
@@ -34,13 +42,11 @@ export async function retrieveNotesForQuestion(
   }
 
   if (merged.length > 0) {
-    merged.sort(
-      (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
-    );
+    merged.sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime());
     return { notes: trimNotesToLimit(merged), strategy: "search" };
   }
 
-  // 3. 兜底：全部笔记（控制 token 上限）
+  // 4. 兜底全量
   notes = await listNotes(userId);
   if (notes.length === 0) {
     return { notes: [], strategy: "empty" };

@@ -1,17 +1,32 @@
-import { streamText } from "ai";
+import {
+  streamText,
+  convertToModelMessages,
+  type UIMessage,
+} from "ai";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { isAuthError, requireAuth } from "@/lib/auth/require-auth";
 import { retrieveNotesForQuestion } from "@/lib/ai/context";
 import { AI_CONFIG, isAiConfigured } from "@/lib/ai/config";
+import { getAiModel } from "@/lib/ai/model";
+import { getLastUserText } from "@/lib/ai/messages";
 import {
   buildMessages,
   buildSystemPrompt,
   formatNotesForPrompt,
 } from "@/lib/ai/prompt";
+import { checkRateLimit } from "@/lib/rate-limit";
+import {
+  ensureChatSession,
+  saveChatMessage,
+  toCitedNoteMeta,
+} from "@/lib/chat/service";
 
-const chatSchema = z.object({
-  message: z.string().min(1, "请输入问题").max(2000, "问题过长"),
+export const maxDuration = 60;
+
+const bodySchema = z.object({
+  messages: z.array(z.unknown()).optional(),
+  message: z.string().optional(),
   history: z
     .array(
       z.object({
@@ -19,8 +34,8 @@ const chatSchema = z.object({
         content: z.string(),
       })
     )
-    .max(10)
     .optional(),
+  sessionId: z.string().uuid().optional(),
 });
 
 export async function POST(request: Request) {
@@ -29,43 +44,88 @@ export async function POST(request: Request) {
 
   if (!isAiConfigured()) {
     return NextResponse.json(
-      { error: "AI 未配置，请在 .env.local 中设置 AI_GATEWAY_API_KEY" },
+      { error: "AI 未配置，请在 .env.local 中设置 DASHSCOPE_API_KEY" },
       { status: 503 }
+    );
+  }
+
+  const { allowed, remaining } = await checkRateLimit(auth.userId, "chat");
+  if (!allowed) {
+    return NextResponse.json(
+      { error: "请求过于频繁，请稍后再试" },
+      { status: 429, headers: { "X-RateLimit-Remaining": "0" } }
     );
   }
 
   try {
     const body = await request.json();
-    const parsed = chatSchema.safeParse(body);
-
+    const parsed = bodySchema.safeParse(body);
     if (!parsed.success) {
-      return NextResponse.json(
-        { error: parsed.error.issues[0]?.message ?? "参数错误" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "参数错误" }, { status: 400 });
     }
 
-    const { message, history } = parsed.data;
+    let question: string;
+    let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>;
+    const sessionIdInput = parsed.data.sessionId;
+
+    if (Array.isArray(body.messages)) {
+      const messages = body.messages as UIMessage[];
+      question = getLastUserText(messages);
+      if (!question) {
+        return NextResponse.json({ error: "请输入问题" }, { status: 400 });
+      }
+      modelMessages = await convertToModelMessages(messages);
+    } else if (parsed.data.message) {
+      question = parsed.data.message;
+      modelMessages = buildMessages(question, parsed.data.history);
+    } else {
+      return NextResponse.json({ error: "请输入问题" }, { status: 400 });
+    }
+
+    const session = await ensureChatSession(
+      auth.userId,
+      sessionIdInput,
+      question
+    );
+
+    await saveChatMessage(session.id, { role: "user", content: question });
 
     const { notes, strategy } = await retrieveNotesForQuestion(
       auth.userId,
-      message
+      question
     );
+    const citedNotes = toCitedNoteMeta(notes);
 
     const notesContext = formatNotesForPrompt(notes);
     const system = buildSystemPrompt(notesContext);
-    const messages = buildMessages(message, history);
 
     const result = streamText({
-      model: AI_CONFIG.model,
+      model: getAiModel(),
       system,
-      messages,
+      messages: modelMessages,
     });
 
     return result.toUIMessageStreamResponse({
       headers: {
+        "X-ZhiNote-Session-Id": session.id,
         "X-ZhiNote-Notes-Count": String(notes.length),
         "X-ZhiNote-Retrieval": strategy,
+        "X-ZhiNote-Model": AI_CONFIG.model,
+        "X-RateLimit-Remaining": String(remaining),
+      },
+      onFinish: async ({ responseMessage }) => {
+        const text = responseMessage.parts
+          .filter((p): p is { type: "text"; text: string } => p.type === "text")
+          .map((p) => p.text)
+          .join("");
+        if (text) {
+          await saveChatMessage(session.id, {
+            role: "assistant",
+            content: text,
+            citedNotes,
+            retrievalStrategy: strategy,
+          });
+        }
       },
     });
   } catch (error) {
