@@ -30,5 +30,13 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": [
+    "node_modules",
+    "components/ui/**",
+    "components/app-sidebar.tsx",
+    "components/liquid-glass.tsx",
+    "components/ambient-bg.tsx",
+    "lib/ui-context.tsx",
+    "lib/utils.ts"
+  ]
 }

@@ -2,6 +2,7 @@ import { after } from "next/server";
 import {
   streamText,
   convertToModelMessages,
+  stepCountIs,
   type UIMessage,
 } from "ai";
 import { NextResponse } from "next/server";
@@ -16,6 +17,9 @@ import {
   buildSystemPrompt,
   formatNotesForPrompt,
 } from "@/lib/ai/prompt";
+import { buildAgentSystemPrompt } from "@/lib/ai/agent-prompt";
+import { createNoteAgentTools } from "@/lib/ai/agent-tools";
+import { listNotes } from "@/lib/notes/service";
 import { checkRateLimit } from "@/lib/rate-limit";
 import {
   ensureChatSession,
@@ -41,6 +45,7 @@ const bodySchema = z
       )
       .optional(),
     sessionId: z.string().uuid().nullish(),
+    mode: z.enum(["knowledge", "agent"]).optional(),
     id: z.string().optional(),
     trigger: z.string().optional(),
     messageId: z.string().optional(),
@@ -73,6 +78,8 @@ export async function POST(request: Request) {
       console.error("[chat/POST] validation:", parsed.error.flatten());
       return NextResponse.json({ error: "参数错误" }, { status: 400 });
     }
+
+    const mode = parsed.data.mode ?? "knowledge";
 
     let question: string;
     let modelMessages: Awaited<ReturnType<typeof convertToModelMessages>>;
@@ -107,12 +114,59 @@ export async function POST(request: Request) {
 
     await saveChatMessage(session.id, { role: "user", content: question });
 
+    const responseHeaders: Record<string, string> = {
+      "X-ZhiNote-Session-Id": session.id,
+      "X-ZhiNote-Model": AI_CONFIG.model,
+      "X-RateLimit-Remaining": String(remaining),
+      "X-ZhiNote-Mode": mode,
+    };
+
+    if (mode === "agent") {
+      const tools = createNoteAgentTools(auth.userId);
+      const recent = await listNotes(auth.userId, { limit: 8 });
+      const noteIndex =
+        recent.length > 0
+          ? recent
+              .map(
+                (n) =>
+                  `- ${n.id} | ${n.title}${n.tags.length ? ` [${n.tags.map((t) => t.name).join(", ")}]` : ""}`
+              )
+              .join("\n")
+          : "（暂无笔记）";
+      const system =
+        buildAgentSystemPrompt(question) +
+        `\n\n## 用户最近笔记索引\n${noteIndex}`;
+
+      const result = streamText({
+        model: getAiModel(),
+        system,
+        messages: modelMessages,
+        tools,
+        stopWhen: stepCountIs(10),
+        onFinish: async ({ text }) => {
+          if (!text) return;
+          after(async () => {
+            await saveChatMessage(session.id, {
+              role: "assistant",
+              content: text,
+              citedNotes: [],
+              retrievalStrategy: "agent",
+            });
+          });
+        },
+      });
+
+      responseHeaders["X-ZhiNote-Retrieval"] = "agent";
+      responseHeaders["X-ZhiNote-Notes-Count"] = "0";
+
+      return result.toUIMessageStreamResponse({ headers: responseHeaders });
+    }
+
     const { notes, strategy } = await retrieveNotesForQuestion(
       auth.userId,
       question
     );
     const citedNotes = toCitedNoteMeta(notes);
-
     const notesContext = formatNotesForPrompt(notes);
     const system = buildSystemPrompt(notesContext);
 
@@ -133,15 +187,10 @@ export async function POST(request: Request) {
       },
     });
 
-    return result.toUIMessageStreamResponse({
-      headers: {
-        "X-ZhiNote-Session-Id": session.id,
-        "X-ZhiNote-Notes-Count": String(notes.length),
-        "X-ZhiNote-Retrieval": strategy,
-        "X-ZhiNote-Model": AI_CONFIG.model,
-        "X-RateLimit-Remaining": String(remaining),
-      },
-    });
+    responseHeaders["X-ZhiNote-Notes-Count"] = String(notes.length);
+    responseHeaders["X-ZhiNote-Retrieval"] = strategy;
+
+    return result.toUIMessageStreamResponse({ headers: responseHeaders });
   } catch (error) {
     console.error("[chat/POST]", error);
     return NextResponse.json({ error: "AI 对话失败" }, { status: 500 });

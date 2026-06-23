@@ -42,6 +42,19 @@ export type ChatSessionDetail = {
   messages: ChatMessageRecord[];
 };
 
+export type NoteDraftPreview = {
+  title: string;
+  content: string;
+  tags: string[];
+  summary: string;
+  sourceFileName: string;
+  sourceFileSize: number;
+  userInstruction?: string;
+  sourceText?: string;
+};
+
+export type ChatMode = "knowledge" | "agent";
+
 export const authApi = {
   register: (email: string, password: string) =>
     api.post<{ user: User }>("/api/auth/register", { email, password }),
@@ -100,4 +113,50 @@ export const chatApi = {
         preview: string;
       }[];
     }>(`/api/chat/preview?q=${encodeURIComponent(q)}`),
+  importFile: async (file: File, instructions: string) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("instructions", instructions);
+    const res = await fetch("/api/chat/import", {
+      method: "POST",
+      credentials: "include",
+      body: form,
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg =
+        payload && typeof payload === "object" && "error" in payload
+          ? String((payload as { error: unknown }).error)
+          : `请求失败 (${res.status})`;
+      throw new Error(msg);
+    }
+    return payload as { draft: NoteDraftPreview };
+  },
+  refineDraft: async (data: {
+    instruction: string;
+    title: string;
+    content: string;
+    tags: string[];
+    summary?: string;
+    sourceFileName?: string;
+    sourceFileSize?: number;
+    sourceText?: string;
+    userInstruction?: string;
+  }) => {
+    const res = await fetch("/api/chat/draft/refine", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg =
+        payload && typeof payload === "object" && "error" in payload
+          ? String((payload as { error: unknown }).error)
+          : `请求失败 (${res.status})`;
+      throw new Error(msg);
+    }
+    return payload as { draft: NoteDraftPreview };
+  },
 };

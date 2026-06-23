@@ -14,11 +14,24 @@ import {
   PanelLeft,
   X,
   RefreshCw,
+  Paperclip,
+  BookOpen,
+  Bot,
 } from "lucide-react";
-import { chatApi, type ChatSessionSummary, type ChatSessionDetail } from "@/lib/api";
+import {
+  chatApi,
+  notesApi,
+  type ChatSessionSummary,
+  type ChatSessionDetail,
+  type ChatMode,
+  type NoteDraftPreview,
+} from "@/lib/api";
 import { useToast } from "@/components/toast";
+import { NoteImportPreview } from "@/components/note-import-preview";
+import { IMPORT_ACCEPT, validateImportFile } from "@/lib/import/rules";
 
 const STORAGE_KEY = "zhinote:active-chat-session";
+const MODE_STORAGE_KEY = "zhinote:chat-mode";
 
 export default function ChatPage() {
   const toast = useToast();
@@ -32,14 +45,27 @@ export default function ChatPage() {
     retrieval?: string;
     model?: string;
     remaining?: number;
+    mode?: ChatMode;
   }>({});
+  const [chatMode, setChatMode] = useState<ChatMode>("knowledge");
+  const chatModeRef = useRef<ChatMode>("knowledge");
+  chatModeRef.current = chatMode;
+  const [importDraft, setImportDraft] = useState<NoteDraftPreview | null>(null);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [refiningDraft, setRefiningDraft] = useState(false);
+  const [savingDraft, setSavingDraft] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const historyRef = useRef<(() => Promise<void>) | null>(null);
 
   const { messages, sendMessage, status, error, setMessages, stop } = useChat({
     transport: new DefaultChatTransport({
       api: "/api/chat",
       credentials: "include",
-      body: () => ({ sessionId: activeId ?? undefined }),
+      body: () => ({
+        sessionId: activeId ?? undefined,
+        mode: chatModeRef.current,
+      }),
       fetch: wrapFetch((res) => {
         const sid = res.headers.get("X-ZhiNote-Session-Id");
         if (sid && sid !== activeId) {
@@ -50,11 +76,16 @@ export default function ChatPage() {
             /* ignore */
           }
         }
+        const modeHeader = res.headers.get("X-ZhiNote-Mode");
         setMeta({
           notesCount: Number(res.headers.get("X-ZhiNote-Notes-Count") ?? ""),
           retrieval: res.headers.get("X-ZhiNote-Retrieval") ?? undefined,
           model: res.headers.get("X-ZhiNote-Model") ?? undefined,
           remaining: Number(res.headers.get("X-RateLimit-Remaining") ?? ""),
+          mode:
+            modeHeader === "agent" || modeHeader === "knowledge"
+              ? modeHeader
+              : chatModeRef.current,
         });
       }),
     }),
@@ -65,9 +96,34 @@ export default function ChatPage() {
 
   const [input, setInput] = useState("");
   const isStreaming = status === "submitted" || status === "streaming";
+  const isBusy = isStreaming || importing;
 
-  function submitText(text: string) {
-    const trimmed = text.trim();
+  async function handleComposerSubmit() {
+    const trimmed = input.trim();
+    const file = pendingFile;
+
+    if (file) {
+      if (!trimmed) {
+        toast.push("请先描述你想如何整理这份文件", "error");
+        return;
+      }
+      if (isBusy) return;
+
+      setImporting(true);
+      try {
+        const { draft } = await chatApi.importFile(file, trimmed);
+        setImportDraft(draft);
+        setInput("");
+        setPendingFile(null);
+      } catch (err) {
+        const er = err as Error;
+        toast.push(er.message ?? "文件整理失败", "error");
+      } finally {
+        setImporting(false);
+      }
+      return;
+    }
+
     if (!trimmed || isStreaming) return;
     setInput("");
     void sendMessage({ text: trimmed });
@@ -103,11 +159,91 @@ export default function ChatPage() {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) setActiveId(saved);
+      const savedMode = localStorage.getItem(MODE_STORAGE_KEY);
+      if (savedMode === "knowledge" || savedMode === "agent") {
+        setChatMode(savedMode);
+      }
     } catch {
       /* ignore */
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  function switchMode(mode: ChatMode) {
+    setChatMode(mode);
+    try {
+      localStorage.setItem(MODE_STORAGE_KEY, mode);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    const err = validateImportFile(file);
+    if (err) {
+      toast.push(err, "error");
+      return;
+    }
+
+    setPendingFile(file);
+    toast.push(`已添加「${file.name}」，请描述整理需求后发送`, "success");
+  }
+
+  function clearPendingFile() {
+    setPendingFile(null);
+  }
+
+  async function saveImport(data: {
+    title: string;
+    content: string;
+    tags: string[];
+  }) {
+    setSavingDraft(true);
+    try {
+      await notesApi.create(data);
+      toast.push("笔记已保存", "success");
+      setImportDraft(null);
+    } catch (err) {
+      const er = err as Error;
+      toast.push(er.message ?? "保存失败", "error");
+    } finally {
+      setSavingDraft(false);
+    }
+  }
+
+  async function handleRefineDraft(data: {
+    instruction: string;
+    title: string;
+    content: string;
+    tags: string[];
+  }) {
+    if (!importDraft) return;
+    setRefiningDraft(true);
+    try {
+      const { draft } = await chatApi.refineDraft({
+        instruction: data.instruction,
+        title: data.title,
+        content: data.content,
+        tags: data.tags,
+        summary: importDraft.summary,
+        sourceFileName: importDraft.sourceFileName,
+        sourceFileSize: importDraft.sourceFileSize,
+        sourceText: importDraft.sourceText,
+        userInstruction: importDraft.userInstruction,
+      });
+      setImportDraft(draft);
+      toast.push("已按新需求更新预览", "success");
+    } catch (err) {
+      const er = err as Error;
+      toast.push(er.message ?? "AI 修改失败", "error");
+    } finally {
+      setRefiningDraft(false);
+    }
+  }
 
   historyRef.current = async () => {
     if (!activeId) {
@@ -165,6 +301,8 @@ export default function ChatPage() {
     setActiveId(null);
     setMessages([]);
     setMeta({});
+    setPendingFile(null);
+    setImportDraft(null);
     try {
       localStorage.removeItem(STORAGE_KEY);
     } catch {
@@ -403,6 +541,28 @@ export default function ChatPage() {
             </div>
           </div>
           <div className="spacer" />
+          <div className="chat-mode-toggle" role="tablist" aria-label="对话模式">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={chatMode === "knowledge"}
+              className={`chat-mode-btn${chatMode === "knowledge" ? " active" : ""}`}
+              onClick={() => switchMode("knowledge")}
+            >
+              <BookOpen size={14} />
+              知识库
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={chatMode === "agent"}
+              className={`chat-mode-btn${chatMode === "agent" ? " active" : ""}`}
+              onClick={() => switchMode("agent")}
+            >
+              <Bot size={14} />
+              智能体
+            </button>
+          </div>
           {typeof meta.remaining === "number" && meta.remaining >= 0 ? (
             <span
               style={{
@@ -428,7 +588,10 @@ export default function ChatPage() {
           <div style={{ maxWidth: 760, margin: "0 auto", padding: "0 20px" }}>
             {messages.length === 0 && !loadingHistory ? (
               <EmptyChat
-                onPick={(q) => submitText(q)}
+                mode={chatMode}
+                onPick={(q) => {
+                  setInput(q);
+                }}
               />
             ) : loadingHistory ? (
               <div className="center-loader"><span className="spinner" /></div>
@@ -469,7 +632,29 @@ export default function ChatPage() {
           }}
         >
           <div style={{ maxWidth: 760, margin: "0 auto" }}>
-            {meta.retrieval ? (
+            <div className="chat-mode-toggle-mobile" role="tablist" aria-label="对话模式">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={chatMode === "knowledge"}
+                className={`chat-mode-btn${chatMode === "knowledge" ? " active" : ""}`}
+                onClick={() => switchMode("knowledge")}
+              >
+                <BookOpen size={14} />
+                知识库
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={chatMode === "agent"}
+                className={`chat-mode-btn${chatMode === "agent" ? " active" : ""}`}
+                onClick={() => switchMode("agent")}
+              >
+                <Bot size={14} />
+                智能体
+              </button>
+            </div>
+            {(meta.retrieval || chatMode === "agent") && meta.retrieval ? (
               <div
                 style={{
                   fontSize: 12,
@@ -478,6 +663,7 @@ export default function ChatPage() {
                   display: "flex",
                   gap: 8,
                   alignItems: "center",
+                  flexWrap: "wrap",
                 }}
               >
                 <span
@@ -492,16 +678,35 @@ export default function ChatPage() {
                 >
                   {retrievalLabel(meta.retrieval)}
                 </span>
-                <span>
-                  引用 {meta.notesCount ?? 0} 条笔记
+                {meta.retrieval !== "agent" ? (
+                  <span>引用 {meta.notesCount ?? 0} 条笔记</span>
+                ) : (
+                  <span>可创建、修改或删除笔记</span>
+                )}
+              </div>
+            ) : null}
+            {pendingFile ? (
+              <div className="pending-file-chip">
+                <FileText size={14} />
+                <span className="pending-file-name" title={pendingFile.name}>
+                  {pendingFile.name}
                 </span>
+                <span className="pending-file-hint">待整理</span>
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-icon btn-sm pending-file-remove"
+                  onClick={clearPendingFile}
+                  aria-label="移除文件"
+                >
+                  <X size={14} />
+                </button>
               </div>
             ) : null}
             <form
               data-chat-form
               onSubmit={(e) => {
                 e.preventDefault();
-                submitText(input);
+                void handleComposerSubmit();
               }}
               style={{
                 display: "flex",
@@ -522,17 +727,41 @@ export default function ChatPage() {
                 (e.currentTarget as HTMLElement).style.boxShadow = "none";
               }}
             >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept={IMPORT_ACCEPT}
+                style={{ display: "none" }}
+                onChange={handleFileSelect}
+              />
+              <button
+                type="button"
+                className="btn btn-ghost btn-icon"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={importing}
+                title="添加文件，输入整理需求后发送"
+                aria-label="添加文件"
+              >
+                <Paperclip size={16} />
+              </button>
               <textarea
                 className="textarea"
-                placeholder="基于你的笔记提问…（Enter 发送，Shift+Enter 换行）"
+                placeholder={
+                  pendingFile
+                    ? "描述你想如何整理这份文件…（Enter 发送，Shift+Enter 换行）"
+                    : chatMode === "agent"
+                      ? "描述你想对笔记做的操作…（Enter 发送，Shift+Enter 换行）"
+                      : "基于你的笔记提问…（Enter 发送，Shift+Enter 换行）"
+                }
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
-                    submitText(input);
+                    void handleComposerSubmit();
                   }
                 }}
+                disabled={importing}
                 rows={1}
                 style={{
                   border: "none",
@@ -545,7 +774,11 @@ export default function ChatPage() {
                   flex: 1,
                 }}
               />
-              {isStreaming ? (
+              {importing ? (
+                <button type="button" className="btn" disabled aria-label="整理中">
+                  <span className="spinner" />
+                </button>
+              ) : isStreaming ? (
                 <button type="button" className="btn btn-secondary" onClick={stop}>
                   停止
                 </button>
@@ -554,7 +787,7 @@ export default function ChatPage() {
                   type="submit"
                   className="btn"
                   disabled={!input.trim()}
-                  aria-label="发送"
+                  aria-label={pendingFile ? "整理文件" : "发送"}
                 >
                   <Send size={15} />
                 </button>
@@ -621,6 +854,16 @@ export default function ChatPage() {
       {sidebarOpen ? (
         <style>{`.chat-sidebar { transform: translateX(0) !important; }`}</style>
       ) : null}
+      {importDraft ? (
+        <NoteImportPreview
+          draft={importDraft}
+          saving={savingDraft}
+          refining={refiningDraft}
+          onClose={() => setImportDraft(null)}
+          onSave={saveImport}
+          onRefine={handleRefineDraft}
+        />
+      ) : null}
     </div>
   );
 }
@@ -644,6 +887,8 @@ function retrievalLabel(s: string) {
       return "全量兜底";
     case "empty":
       return "无笔记";
+    case "agent":
+      return "智能体";
     default:
       return s;
   }
@@ -659,6 +904,8 @@ function retrievalColor(s: string) {
       return "var(--warning-600)";
     case "empty":
       return "var(--neutral-500)";
+    case "agent":
+      return "var(--accent-600)";
     default:
       return "var(--neutral-600)";
   }
@@ -802,15 +1049,24 @@ function MessageBubble({
 }
 
 function EmptyChat({
+  mode,
   onPick,
 }: {
+  mode: ChatMode;
   onPick: (q: string) => void;
 }) {
-  const suggestions = [
+  const knowledgeSuggestions = [
     "总结一下我最近的笔记",
     "关于学习的内容有哪些？",
     "帮我梳理一下项目的关键点",
   ];
+  const agentSuggestions = [
+    "帮我创建一条关于本周计划的笔记",
+    "把标题包含「学习」的笔记列出来",
+    "新建笔记：会议纪要模板",
+  ];
+  const suggestions = mode === "agent" ? agentSuggestions : knowledgeSuggestions;
+
   return (
     <div style={{ textAlign: "center", padding: "48px 20px" }}>
       <span
@@ -826,11 +1082,18 @@ function EmptyChat({
           boxShadow: "var(--shadow-md)",
         }}
       >
-        <Sparkles size={28} />
+        {mode === "agent" ? <Bot size={28} /> : <Sparkles size={28} />}
       </span>
-      <h2 style={{ fontSize: 20, marginBottom: 6 }}>向你的知识库提问</h2>
+      <h2 style={{ fontSize: 20, marginBottom: 6 }}>
+        {mode === "agent" ? "智能体笔记助手" : "向你的知识库提问"}
+      </h2>
       <p style={{ color: "var(--text-muted)", marginBottom: 24, maxWidth: 420, margin: "0 auto 24px" }}>
-        我会从你的笔记中检索相关内容，并基于它们给出回答。
+        {mode === "agent"
+          ? "我会理解你的需求，自动创建、修改或删除笔记。"
+          : "我会从你的笔记中检索相关内容，并基于它们给出回答。"}
+      </p>
+      <p style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 16 }}>
+        点击 📎 添加文件（支持 .txt / .md / .docx 等），输入整理需求后发送
       </p>
       <div
         style={{
